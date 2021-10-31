@@ -39,8 +39,9 @@ class ScaledDotProductAttention(nn.Module):
     def __init__(self):
         super(ScaledDotProductAttention, self).__init__()
 
-    def forward(self, Q, K, V, attn_mask):
-        scores = torch.matmul(Q, K.tranpose(-1, -2)) / np.sqrt(d_k)
+    @staticmethod
+    def forward(Q, K, V, attn_mask):
+        scores = torch.matmul(Q, K.transpose(-1, -2)) / np.sqrt(d_k)
 
         scores.masked_fill_(attn_mask, -1e9)
         attn = nn.Softmax(dim=1)(scores)
@@ -93,6 +94,16 @@ class PoswiseFeedForwardNet(nn.Module):
         return self.layer_norm(output + residual)
 
 
+def get_attn_pad_mask(seq_q, seq_k):
+    print("seq_q size: ", seq_q.size())
+    print("seq_k size: ", seq_k.size())
+
+    batch_size, len_q = seq_q.size()[0], seq_q.size()[1]
+    batch_size, len_k = seq_k.size()[0], seq_k.size()[1]
+    pad_attn_mask = seq_k.data.eq(0).unsqueeze(1)
+    return pad_attn_mask.expand(batch_size, len_q, len_k)
+
+
 class EncoderLayer(nn.Module):
     def __init__(self):
         super(EncoderLayer, self).__init__()
@@ -125,16 +136,41 @@ class Encoder(nn.Module):
         return enc_out, enc_self_attns
 
 
+def get_attn_subsequent_mask(seq):
+    """
+    :param seq: [batch_size, tgt_len]
+    :return subsequence_mask: [batch_size, tgt_len, tgt_len]
+    """
+    attn_shape = [seq.size(0), seq.size(1), seq.size(1)]  # [batch_size, tgt_len, tgt_len]
+    subsequence_mask = np.triu(np.ones(attn_shape), k=1)
+    subsequence_mask = torch.from_numpy(subsequence_mask).byte()
+    return subsequence_mask
+
+
+class DecoderLayer(nn.Module):
+    def __init__(self):
+        super(DecoderLayer, self).__init__()
+        self.dec_self_attn = MultiHeadAttention()
+        self.dec_enc_attn = MultiHeadAttention()
+        self.pos_ffn = PoswiseFeedForwardNet()
+
+    def forward(self, dec_in, enc_out, dec_self_attn_mask, dec_enc_attn_mask):
+        dec_out, dec_self_attn = self.dec_self_attn(dec_in, dec_in, dec_in, dec_self_attn_mask)
+        dec_out, dec_enc_attn = self.dec_enc_attn(dec_out, enc_out, enc_out, dec_enc_attn_mask)
+        dec_out = self.pos_ffn(dec_out)
+        return dec_out, dec_self_attn, dec_enc_attn
+
+
 class Decoder(nn.Module):
     def __init__(self):
         super(Decoder, self).__init__()
         self.tgt_emb = nn.Embedding(tgt_vocab_size, d_model)
         self.pos_emb = PositionalEncoding(d_model)
-        self.layers = nn.Module([DocoderLayer() for _ in range(n_layers)])
+        self.layers = nn.ModuleList([DecoderLayer() for _ in range(n_layers)])
 
     def forward(self, dec_in, enc_in, enc_out):
-        dec_out = self.tgt_emb(dec_inputs)
-        dec_out = self.pos_emb(dec_out.transpose(0, 1)).tranpose(0, 1)
+        dec_out = self.tgt_emb(dec_in)
+        dec_out = self.pos_emb(dec_out.transpose(0, 1)).transpose(0, 1)
 
         dec_self_attn_pad_mask = get_attn_pad_mask(dec_in, dec_in)
         dec_self_attn_subsequent_mask = get_attn_subsequent_mask(dec_in)
@@ -168,13 +204,31 @@ class Transformer(nn.Module):
         return dec_logits, enc_self_attns, dec_self_attns, dec_enc_attns
 
 
+def make_batch(sentences):
+    input_batch = [[src_vocab[n] for n in sentences[0].split()]]
+    output_batch = [[tgt_vocab[n] for n in sentences[1].split()]]
+    target_batch = [[tgt_vocab[n] for n in sentences[2].split()]]
+    return torch.LongTensor(input_batch), torch.LongTensor(output_batch), torch.LongTensor(target_batch)
+
+
+def visualization(attn):
+    attn = attn[-1].squeeze(0)[0]
+    attn = attn.squeeze(0).data.numpy()
+    fig = plt.figure(figsize=(n_heads, n_heads))
+    ax = fig.add_subplot(1, 1, 1)
+    ax.matshow(attn, cmap='viridis')
+    ax.set_xticklabels([''] + sentences[0].split(), fontdict={'fontsize': 14}, rotation=90)
+    ax.set_yticklabels([''] + sentences[2].split(), fontdict={'fontsize': 14})
+    plt.show()
+
+
 if __name__ == '__main__':
 
     sentences = ['ich mochte ein bier P', 'S i want a beer', 'i want a beer E']
 
     # Transformer Parameters
     # Padding Should be Zero
-    ## Create vocabulary
+    # Create vocabulary
     src_vocab = {'P': 0, 'ich': 1, 'mochte': 2, 'ein': 3, 'bier': 4}
     src_vocab_size = len(src_vocab)
 
@@ -184,25 +238,40 @@ if __name__ == '__main__':
     src_len = 5  # length of source
     tgt_len = 5  # length of target
 
-    ## Params
+    # Params
     d_model = 512  # Embedding Size
     d_ff = 2048  # FeedForward dimension
     d_k = d_v = 64  # dimension of K(=Q), V
     n_layers = 6  # number of Encoder of Decoder Layer
     n_heads = 8  # number of heads in Multi-Head Attention
 
-    # model = Transformer()
-    #
-    # criterion = nn.CrossEntropyLoss()
-    # optimizer = optim.Adam(model.parameters(), lr=0.001)
-    #
-    # enc_inputs, dec_inputs, target_batch = make_batch(sentences)
-    #
-    # for epoch in range(20):
-    #     optimizer.zero_grad()
-    #     outputs, enc_self_attns, dec_self_attns, dec_enc_attns = model(enc_inputs, dec_inputs)
-    #     loss = criterion(outputs, target_batch.contiguous().view(-1))
-    #     print('Epoch:', '%04d' % (epoch + 1), 'cost =', '{:.6f}'.format(loss))
-    #     loss.backward()
-    #     optimizer.step()
+    # Instantiate
+    model = Transformer()
 
+    # Train
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    enc_inputs, dec_inputs, target_batch = make_batch(sentences)
+
+    for epoch in range(20):
+        optimizer.zero_grad()
+        outputs, enc_self_attns, dec_self_attns, dec_enc_attns = model(enc_inputs, dec_inputs)
+        loss = criterion(outputs, target_batch.contiguous().view(-1))
+        print('Epoch:', '%04d' % (epoch + 1), 'cost =', '{:.6f}'.format(loss))
+        loss.backward()
+        optimizer.step()
+
+    # Test
+    predict, _, _, _ = model(enc_inputs, dec_inputs)
+    predict = predict.data.max(1, keepdim=True)[1]
+    print(sentences[0], '->', [number_dict[n.item()] for n in predict.squeeze()])
+
+    print('first head of last state enc_self_attns')
+    visualization(enc_self_attns)
+
+    print('first head of last state dec_self_attns')
+    visualization(dec_self_attns)
+
+    print('first head of last state dec_enc_attns')
+    visualization(dec_enc_attns)
